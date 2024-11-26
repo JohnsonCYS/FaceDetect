@@ -15,6 +15,11 @@ import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.video.FileOutputOptions;
+import androidx.camera.video.Recorder;
+import androidx.camera.video.Recording;
+import androidx.camera.video.VideoCapture;
+import androidx.camera.video.VideoRecordEvent;
 import androidx.camera.view.PreviewView;
 import androidx.core.content.ContextCompat;
 
@@ -32,9 +37,16 @@ import androidx.annotation.NonNull;
 
 import androidx.core.app.ActivityCompat;
 
+import java.io.File;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+
+import android.os.Handler;
+import android.os.Looper;
+
+import android.os.Handler;
+import android.os.Looper;
 
 public class CustomPulseActivity extends AppCompatActivity {
 
@@ -44,6 +56,12 @@ public class CustomPulseActivity extends AppCompatActivity {
     private PreviewView textureView;
     private long lastAnalysisTime = 0;  // 上次分析的时间戳
     private FaceCrossView faceCrossView;
+    private VideoCapture<Recorder> videoCapture;
+    private Recording currentRecording;
+    private Handler recordingHandler; // 用于定时任务
+    private Runnable stopRecordingRunnable; // 定时任务逻辑
+    private long recordingStartTime = 0; // 记录录制开始的时间戳
+    public static final int RecordDuration =5000;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -51,8 +69,9 @@ public class CustomPulseActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         textureView = findViewById(R.id.viewFinder);
-        faceCrossView = findViewById(R.id.faceCrossView);  // 初始化 FaceCrossView
+        faceCrossView = findViewById(R.id.faceCrossView); // 初始化 FaceCrossView
         cameraExecutor = Executors.newSingleThreadExecutor();
+        recordingHandler = new Handler(Looper.getMainLooper()); // 初始化 Handler
 
         // 检查权限
         if (checkCameraPermission()) {
@@ -61,16 +80,17 @@ public class CustomPulseActivity extends AppCompatActivity {
             requestCameraPermission();
         }
     }
-
     private boolean checkCameraPermission() {
         return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                == PackageManager.PERMISSION_GRANTED;
+                == PackageManager.PERMISSION_GRANTED &&
+                ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                        == PackageManager.PERMISSION_GRANTED;
     }
 
     private void requestCameraPermission() {
         ActivityCompat.requestPermissions(
                 this,
-                new String[]{Manifest.permission.CAMERA},
+                new String[]{Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO},
                 CAMERA_PERMISSION_REQUEST_CODE
         );
     }
@@ -105,12 +125,17 @@ public class CustomPulseActivity extends AppCompatActivity {
 
                 imageAnalysis.setAnalyzer(cameraExecutor, this::analyzeImage);
 
-                // 绑定用例到 CameraX 的生命周期
-                cameraProvider.unbindAll();
-                Camera camera = cameraProvider.bindToLifecycle(
-                        this, cameraSelector, preview, imageAnalysis);
+                // 配置 VideoCapture（新的 API）
+                Recorder recorder = new Recorder.Builder()
+                        .build();
 
-                // 打印当前选择的分辨率
+                videoCapture = VideoCapture.withOutput(recorder);
+
+                // 绑定所有用例到 CameraX 的生命周期
+                cameraProvider.unbindAll();
+                cameraProvider.bindToLifecycle(
+                        this, cameraSelector, preview, imageAnalysis, videoCapture);
+
                 Log.d("CameraResolution", "当前选择的分辨率: 640x640");
 
             } catch (Exception e) {
@@ -118,6 +143,26 @@ public class CustomPulseActivity extends AppCompatActivity {
             }
         }, ContextCompat.getMainExecutor(this));
     }
+
+    // 权限回调处理
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
+        if (requestCode == CAMERA_PERMISSION_REQUEST_CODE) {
+            if (grantResults.length > 0 &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED &&
+                    grantResults[1] == PackageManager.PERMISSION_GRANTED) {
+                // 权限被授予，启动摄像头
+                startCamera(textureView);
+            } else {
+                // 权限被拒绝，提示用户
+                Toast.makeText(this, "摄像头或麦克风权限被拒绝，无法使用该功能！", Toast.LENGTH_SHORT).show();
+            }
+        }
+    }
+
 
     private void analyzeImage(ImageProxy imageProxy) {
         long timestamp = System.currentTimeMillis();
@@ -192,23 +237,82 @@ public class CustomPulseActivity extends AppCompatActivity {
                 .addOnCompleteListener(task -> imageProxy.close());
     }
 
+    private void onFaceDetected() {
+        runOnUiThread(() -> {
+            Log.e("FaceDetection", "Face detected");
+            if (currentRecording == null) {
+                startRecording();
+            }
+        });
+    }
 
     private boolean isFaceCentered(float centerX, float centerY, Size previewSize) {
-        // 获取PreviewView的中心点
+        // 获取 PreviewView 的中心点
         float previewCenterX = previewSize.getWidth() / 2;
         float previewCenterY = previewSize.getHeight() / 2;
 
-        // 判断人脸中心是否在PreviewView的中央（±30%范围）
+        // 判断人脸中心是否在 PreviewView 的中央（±30% 范围）
         return Math.abs(centerX - previewCenterX) < previewSize.getWidth() * 0.3 &&
                 Math.abs(centerY - previewCenterY) < previewSize.getHeight() * 0.3;
     }
-
-    private void onFaceDetected() {
-        runOnUiThread(() -> Log.e("cys","人脸检测到了"));
+    private void onFaceLost() {
+        runOnUiThread(() -> {
+            Log.e("FaceDetection", "Face lost");
+            if (currentRecording != null && System.currentTimeMillis() - recordingStartTime < RecordDuration) {
+                stopRecording(true); // 在 15 秒内丢失人脸，删除文件
+            }
+        });
     }
 
-    private void onFaceLost() {
-        runOnUiThread(() -> Log.e("cys","人脸检测到了"));
+    private void startRecording() {
+        if (videoCapture == null) return;
+
+        File videoFile = new File(getExternalFilesDir(null), "recorded_video.mp4");
+        if (videoFile.exists() && videoFile.delete()) {
+            Log.e("VideoCapture", "Temporary file deleted.");
+        }
+        FileOutputOptions outputOptions = new FileOutputOptions.Builder(videoFile).build();
+
+        currentRecording = videoCapture.getOutput()
+                .prepareRecording(this, outputOptions)
+                .start(ContextCompat.getMainExecutor(this), event -> {
+                    if (event instanceof VideoRecordEvent.Start) {
+                        Log.e("VideoCapture", "Recording started");
+                    } else if (event instanceof VideoRecordEvent.Finalize) {
+                        Log.e("VideoCapture", "Recording finalized: " +
+                                ((VideoRecordEvent.Finalize) event).getOutputResults().getOutputUri());
+                    }
+                });
+
+        // 设置录制开始的时间
+        recordingStartTime = System.currentTimeMillis();
+
+        // 启动定时任务，15秒后停止录制
+        stopRecordingRunnable = () -> {
+            if (currentRecording != null) {
+                stopRecording(false); // 超过15秒，停止录制并保留文件
+            }
+        };
+        recordingHandler.postDelayed(stopRecordingRunnable, RecordDuration);
+    }
+
+    private void stopRecording(boolean isDelete) {
+        if (currentRecording != null) {
+            currentRecording.stop();
+            currentRecording = null;
+
+            // 删除定时任务，避免重复执行
+            if (stopRecordingRunnable != null) {
+                recordingHandler.removeCallbacks(stopRecordingRunnable);
+            }
+
+            if (isDelete) {
+                File videoFile = new File(getExternalFilesDir(null), "recorded_video.mp4");
+                if (videoFile.exists() && videoFile.delete()) {
+                    Log.e("VideoCapture", "Temporary file deleted.");
+                }
+            }
+        }
     }
 
     @Override
@@ -217,21 +321,8 @@ public class CustomPulseActivity extends AppCompatActivity {
         if (cameraExecutor != null) {
             cameraExecutor.shutdown();
         }
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
-                                           @NonNull int[] grantResults) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
-
-        if (requestCode == CAMERA_PERMISSION_REQUEST_CODE) {
-            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                // 权限被授予，启动摄像头
-                startCamera(textureView);
-            } else {
-                // 权限被拒绝，提示用户
-                Toast.makeText(this, "摄像头权限被拒绝，无法使用摄像头功能！", Toast.LENGTH_SHORT).show();
-            }
+        if (recordingHandler != null) {
+            recordingHandler.removeCallbacksAndMessages(null);
         }
     }
 }
